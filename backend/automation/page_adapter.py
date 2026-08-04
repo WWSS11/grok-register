@@ -344,7 +344,11 @@ class CamoufoxPage:
         self._context = context or page.context
 
     # ── 导航 ──
-    def get(self, url: str, **kw):
+def get(self, url: str, **kw):
+        """导航方法，设置更高的默认超时时间（60-90秒），防止 xAI 注册页加载超时。"""
+        # 默认超时从 30s 增加到 90s，防止页面加载慢导致 Page.goto Timeout
+        kw.setdefault('timeout', 90000)  # 90 秒
+
         self._page.goto(url, **kw)
 
     def back(self):
