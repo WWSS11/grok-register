@@ -10,8 +10,9 @@ import datetime as _datetime
 import json
 import os
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 
 RESULT_COLUMNS = (
@@ -33,6 +34,12 @@ RESULT_COLUMNS = (
     "auth_path",
     "cpa_auth_path",
     "grok2api_auth_path",
+    "cpa_remote_status",
+    "cpa_remote_imported_at",
+    "cpa_remote_error",
+    "grok2api_remote_status",
+    "grok2api_remote_imported_at",
+    "grok2api_remote_error",
     "email_account_id",
     "email_disable_status",
     "email_disabled_at",
@@ -46,6 +53,8 @@ RESULT_COLUMNS = (
     "extra_json",
 )
 
+SQLITE_IN_BATCH_SIZE = 900
+
 
 class RegistrationRepository:
     def __init__(self, database_path: os.PathLike[str] | str):
@@ -57,13 +66,21 @@ class RegistrationRepository:
     def now_text() -> str:
         return _datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.database_path, timeout=15.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=15000")
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=15000")
+            yield conn
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def _initialize(self) -> None:
         with self._connect() as conn:
@@ -89,6 +106,12 @@ class RegistrationRepository:
                     auth_path TEXT NOT NULL DEFAULT '',
                     cpa_auth_path TEXT NOT NULL DEFAULT '',
                     grok2api_auth_path TEXT NOT NULL DEFAULT '',
+                    cpa_remote_status TEXT NOT NULL DEFAULT 'not_configured',
+                    cpa_remote_imported_at TEXT NOT NULL DEFAULT '',
+                    cpa_remote_error TEXT NOT NULL DEFAULT '',
+                    grok2api_remote_status TEXT NOT NULL DEFAULT 'not_configured',
+                    grok2api_remote_imported_at TEXT NOT NULL DEFAULT '',
+                    grok2api_remote_error TEXT NOT NULL DEFAULT '',
                     email_account_id TEXT NOT NULL DEFAULT '',
                     email_disable_status TEXT NOT NULL DEFAULT 'not_attempted',
                     email_disabled_at TEXT NOT NULL DEFAULT '',
@@ -124,6 +147,12 @@ class RegistrationRepository:
                 "email_disabled_at": "TEXT NOT NULL DEFAULT ''",
                 "email_disable_error": "TEXT NOT NULL DEFAULT ''",
                 "screenshot_path": "TEXT NOT NULL DEFAULT ''",
+                "cpa_remote_status": "TEXT NOT NULL DEFAULT 'not_configured'",
+                "cpa_remote_imported_at": "TEXT NOT NULL DEFAULT ''",
+                "cpa_remote_error": "TEXT NOT NULL DEFAULT ''",
+                "grok2api_remote_status": "TEXT NOT NULL DEFAULT 'not_configured'",
+                "grok2api_remote_imported_at": "TEXT NOT NULL DEFAULT ''",
+                "grok2api_remote_error": "TEXT NOT NULL DEFAULT ''",
             }
             for column, definition in migrations.items():
                 if column not in existing_columns:
@@ -140,11 +169,19 @@ class RegistrationRepository:
             )
             conn.execute(
                 """
+                UPDATE registration_results
+                SET cpa_remote_status = 'success'
+                WHERE cpa_remote_status = 'not_configured'
+                  AND auth_info LIKE '%CPA 远程:%'
+                """
+            )
+            conn.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_registration_results_email_disable_status
                 ON registration_results(email_disable_status)
                 """
             )
-            conn.execute("PRAGMA user_version = 3")
+            conn.execute("PRAGMA user_version = 4")
 
     def add_result(self, record: Dict[str, Any]) -> int:
         now = self.now_text()
@@ -175,6 +212,16 @@ class RegistrationRepository:
             "auth_path": str(record.get("auth_path") or ""),
             "cpa_auth_path": str(record.get("cpa_auth_path") or ""),
             "grok2api_auth_path": str(record.get("grok2api_auth_path") or ""),
+            "cpa_remote_status": str(record.get("cpa_remote_status") or "not_configured"),
+            "cpa_remote_imported_at": str(record.get("cpa_remote_imported_at") or ""),
+            "cpa_remote_error": str(record.get("cpa_remote_error") or ""),
+            "grok2api_remote_status": str(
+                record.get("grok2api_remote_status") or "not_configured"
+            ),
+            "grok2api_remote_imported_at": str(
+                record.get("grok2api_remote_imported_at") or ""
+            ),
+            "grok2api_remote_error": str(record.get("grok2api_remote_error") or ""),
             "email_account_id": str(record.get("email_account_id") or ""),
             "email_disable_status": str(
                 record.get("email_disable_status") or "not_attempted"
@@ -214,14 +261,13 @@ class RegistrationRepository:
             ).fetchone()
         return row is not None
 
-    def list_results(
-        self,
+    @staticmethod
+    def _result_filters(
         *,
         status: str = "",
         email_disable_status: str = "",
         keyword: str = "",
-        limit: int = 2000,
-    ) -> List[Dict[str, Any]]:
+    ) -> Tuple[str, List[Any]]:
         clauses = []
         params: List[Any] = []
         normalized_status = str(status or "").strip().lower()
@@ -241,8 +287,25 @@ class RegistrationRepository:
             )
             params.extend([like, like, like, like, like, like, like])
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return where, params
+
+    def list_results(
+        self,
+        *,
+        status: str = "",
+        email_disable_status: str = "",
+        keyword: str = "",
+        limit: int = 2000,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        where, params = self._result_filters(
+            status=status,
+            email_disable_status=email_disable_status,
+            keyword=keyword,
+        )
         safe_limit = max(1, min(int(limit or 2000), 10000))
-        params.append(safe_limit)
+        safe_offset = max(0, int(offset or 0))
+        params.extend([safe_limit, safe_offset])
         with self._connect() as conn:
             rows = conn.execute(
                 f"""
@@ -250,11 +313,30 @@ class RegistrationRepository:
                 FROM registration_results
                 {where}
                 ORDER BY finished_at DESC, id DESC
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
                 params,
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def count_results(
+        self,
+        *,
+        status: str = "",
+        email_disable_status: str = "",
+        keyword: str = "",
+    ) -> int:
+        """返回与账号列表相同筛选条件下的记录总数。"""
+        where, params = self._result_filters(
+            status=status,
+            email_disable_status=email_disable_status,
+            keyword=keyword,
+        )
+        with self._connect() as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*) AS total FROM registration_results {where}", params
+            ).fetchone()
+        return int(row["total"] or 0)
 
     def get_results_by_ids(self, ids: Iterable[int | str]) -> List[Dict[str, Any]]:
         """按主键批量读取记录，保持传入顺序。"""
@@ -271,17 +353,20 @@ class RegistrationRepository:
             normalized.append(value)
         if not normalized:
             return []
-        placeholders = ", ".join("?" for _ in normalized)
+        by_id: Dict[int, Dict[str, Any]] = {}
         with self._connect() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT *
-                FROM registration_results
-                WHERE id IN ({placeholders})
-                """,
-                normalized,
-            ).fetchall()
-        by_id = {int(row["id"]): dict(row) for row in rows}
+            for start in range(0, len(normalized), SQLITE_IN_BATCH_SIZE):
+                batch = normalized[start : start + SQLITE_IN_BATCH_SIZE]
+                placeholders = ", ".join("?" for _ in batch)
+                rows = conn.execute(
+                    f"""
+                    SELECT *
+                    FROM registration_results
+                    WHERE id IN ({placeholders})
+                    """,
+                    batch,
+                ).fetchall()
+                by_id.update({int(row["id"]): dict(row) for row in rows})
         return [by_id[item_id] for item_id in normalized if item_id in by_id]
 
     def update_relogin_result(
@@ -346,6 +431,22 @@ class RegistrationRepository:
                         "auth_path": str(detail.get("auth_path") or ""),
                         "cpa_auth_path": str(detail.get("cpa_auth_path") or ""),
                         "grok2api_auth_path": str(detail.get("grok2api_auth_path") or ""),
+                        "cpa_remote_status": str(
+                            detail.get("cpa_remote_status") or "not_configured"
+                        ),
+                        "cpa_remote_imported_at": str(
+                            detail.get("cpa_remote_imported_at") or ""
+                        ),
+                        "cpa_remote_error": str(detail.get("cpa_remote_error") or ""),
+                        "grok2api_remote_status": str(
+                            detail.get("grok2api_remote_status") or "not_configured"
+                        ),
+                        "grok2api_remote_imported_at": str(
+                            detail.get("grok2api_remote_imported_at") or ""
+                        ),
+                        "grok2api_remote_error": str(
+                            detail.get("grok2api_remote_error") or ""
+                        ),
                     }
                 )
                 assignments.extend(
@@ -358,6 +459,12 @@ class RegistrationRepository:
                         "auth_path = :auth_path",
                         "cpa_auth_path = :cpa_auth_path",
                         "grok2api_auth_path = :grok2api_auth_path",
+                        "cpa_remote_status = :cpa_remote_status",
+                        "cpa_remote_imported_at = :cpa_remote_imported_at",
+                        "cpa_remote_error = :cpa_remote_error",
+                        "grok2api_remote_status = :grok2api_remote_status",
+                        "grok2api_remote_imported_at = :grok2api_remote_imported_at",
+                        "grok2api_remote_error = :grok2api_remote_error",
                     ]
                 )
                 if relogin_status == "success" and not screenshot_path:
@@ -368,18 +475,55 @@ class RegistrationRepository:
             )
             return bool(cursor.rowcount)
 
+    def update_remote_import_status(
+        self,
+        account_id: int,
+        kind: str,
+        *,
+        status: str,
+        error: str = "",
+        imported_at: str = "",
+    ) -> bool:
+        """更新 CPA 或 Grok2API 的远程入库状态。"""
+        normalized_kind = str(kind or "").strip().lower()
+        if normalized_kind not in {"cpa", "grok2api"}:
+            raise ValueError("kind 必须是 cpa 或 grok2api")
+        try:
+            normalized_id = int(account_id)
+        except (TypeError, ValueError):
+            return False
+        if normalized_id <= 0:
+            return False
+        normalized_status = str(status or "failed").strip().lower()
+        timestamp = str(imported_at or "")
+        if normalized_status in {"success", "partial"} and not timestamp:
+            timestamp = self.now_text()
+        prefix = f"{normalized_kind}_remote"
+        with self._connect() as conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE registration_results
+                SET {prefix}_status = ?, {prefix}_imported_at = ?, {prefix}_error = ?
+                WHERE id = ?
+                """,
+                (normalized_status, timestamp, str(error or ""), normalized_id),
+            )
+            return bool(cursor.rowcount)
+
     def delete_results(self, ids: Iterable[int | str]) -> List[Dict[str, Any]]:
         """删除指定记录，返回实际删除前的记录快照。"""
         records = self.get_results_by_ids(ids)
         if not records:
             return []
         delete_ids = [int(row["id"]) for row in records]
-        placeholders = ", ".join("?" for _ in delete_ids)
         with self._connect() as conn:
-            conn.execute(
-                f"DELETE FROM registration_results WHERE id IN ({placeholders})",
-                delete_ids,
-            )
+            for start in range(0, len(delete_ids), SQLITE_IN_BATCH_SIZE):
+                batch = delete_ids[start : start + SQLITE_IN_BATCH_SIZE]
+                placeholders = ", ".join("?" for _ in batch)
+                conn.execute(
+                    f"DELETE FROM registration_results WHERE id IN ({placeholders})",
+                    batch,
+                )
         return records
 
     def stats(self) -> Dict[str, Any]:

@@ -1,6 +1,7 @@
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from backend.registration.store import RegistrationRepository
@@ -40,7 +41,7 @@ class RegistrationRepositoryMigrationTests(unittest.TestCase):
     def test_old_database_migrates_and_filters_disable_status(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "results.sqlite3"
-            with sqlite3.connect(path) as conn:
+            with closing(sqlite3.connect(path)) as conn:
                 conn.executescript(OLD_SCHEMA)
                 conn.execute(
                     """
@@ -50,12 +51,13 @@ class RegistrationRepositoryMigrationTests(unittest.TestCase):
                             'old@example.com', 'success', 1, 'cloudflare')
                     """
                 )
+                conn.commit()
 
             store = RegistrationRepository(path)
-            with sqlite3.connect(path) as conn:
+            with closing(sqlite3.connect(path)) as conn:
                 columns = {row[1] for row in conn.execute("PRAGMA table_info(registration_results)")}
                 version = conn.execute("PRAGMA user_version").fetchone()[0]
-            self.assertEqual(version, 3)
+            self.assertEqual(version, 4)
             self.assertTrue(
                 {
                     "email_account_id",
@@ -65,6 +67,12 @@ class RegistrationRepositoryMigrationTests(unittest.TestCase):
                     "cpa_auth_path",
                     "grok2api_auth_path",
                     "screenshot_path",
+                    "cpa_remote_status",
+                    "cpa_remote_imported_at",
+                    "cpa_remote_error",
+                    "grok2api_remote_status",
+                    "grok2api_remote_imported_at",
+                    "grok2api_remote_error",
                 }.issubset(columns)
             )
             self.assertEqual(store.list_results()[0]["email_disable_status"], "not_applicable")
@@ -96,11 +104,55 @@ class RegistrationRepositoryMigrationTests(unittest.TestCase):
 
             filtered = store.list_results(email_disable_status="failed")
             self.assertEqual([row["email"] for row in filtered], ["failed@outlook.com"])
+            self.assertEqual(store.count_results(), 3)
+            self.assertEqual(len(store.list_results(limit=1, offset=1)), 1)
+            self.assertEqual(
+                store.count_results(email_disable_status="failed"), 1
+            )
             stats = store.stats()
             self.assertEqual(stats["email_disabled"], 1)
             self.assertEqual(stats["email_disable_failed"], 1)
             disabled = next(row for row in store.list_results() if row["email"] == "disabled@outlook.com")
             self.assertEqual(disabled["screenshot_path"], "/tmp/failure.png")
+            self.assertEqual(disabled["grok2api_remote_status"], "not_configured")
+
+            self.assertTrue(
+                store.update_remote_import_status(
+                    disabled["id"], "grok2api", status="success"
+                )
+            )
+            refreshed = store.get_results_by_ids([disabled["id"]])[0]
+            self.assertEqual(refreshed["grok2api_remote_status"], "success")
+            self.assertTrue(refreshed["grok2api_remote_imported_at"])
+
+    def test_pagination_filters_and_large_id_batches_share_consistent_results(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RegistrationRepository(Path(tmp) / "results.sqlite3")
+            for index in range(5):
+                store.add_result(
+                    {
+                        "email": f"user-{index}@example.com",
+                        "status": "success" if index < 4 else "failure",
+                        "provider": "fixture",
+                        "finished_at": f"2026-08-04 00:00:0{index}",
+                    }
+                )
+
+            self.assertEqual(store.count_results(status="success", keyword="user-"), 4)
+            page = store.list_results(
+                status="success",
+                keyword="user-",
+                limit=2,
+                offset=2,
+            )
+            self.assertEqual(
+                [row["email"] for row in page],
+                ["user-1@example.com", "user-0@example.com"],
+            )
+            records = store.get_results_by_ids(range(1, 1006))
+            self.assertEqual([row["id"] for row in records], [1, 2, 3, 4, 5])
+            self.assertEqual(len(store.delete_results(range(1, 1006))), 5)
+            self.assertEqual(store.count_results(), 0)
 
 
 if __name__ == "__main__":

@@ -31,6 +31,13 @@ export type AccountRecord = {
   grok2api_auth_path: string;
   cpa_auth_available: boolean;
   grok2api_auth_available: boolean;
+  cpa_remote_status: string;
+  cpa_remote_imported_at: string;
+  cpa_remote_error: string;
+  grok2api_remote_status: string;
+  grok2api_remote_imported_at: string;
+  grok2api_remote_error: string;
+  grok2api_remote_configured: boolean;
   email_account_id: string;
   email_disable_status: string;
   email_disabled_at: string;
@@ -40,6 +47,9 @@ export type AccountRecord = {
   failure_reason: string;
   screenshot_path: string;
   screenshot_url: string;
+  exception_traceback: string;
+  exception_type: string;
+  has_exception_traceback: boolean;
   nsfw_status: string;
   started_at: string;
   finished_at: string;
@@ -89,6 +99,17 @@ export type ReloginStatus = {
   error: string;
   started_at?: number | null;
   finished_at?: number | null;
+  total_count: number;
+  completed_count: number;
+  success_count: number;
+  failed_count: number;
+};
+
+export type AuthArchiveDownload = {
+  blob: Blob;
+  filename: string;
+  exported: number;
+  skipped: number;
 };
 
 export type ConfigFileSnapshot = {
@@ -130,6 +151,39 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   return data as T;
 }
 
+async function downloadAuthArchive(
+  ids: number[],
+  kind: "cpa" | "grok2api"
+): Promise<AuthArchiveDownload> {
+  const response = await fetch(`/api/accounts/auth-json/${kind}/download`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ids }),
+  });
+  if (!response.ok) {
+    let data: any = null;
+    try {
+      data = await response.json();
+    } catch {
+      data = null;
+    }
+    if (response.status === 401 && data?.auth_required) {
+      window.dispatchEvent(
+        new CustomEvent("grok-auth-required", { detail: { setupRequired: !!data?.setup_required } })
+      );
+    }
+    throw new Error(data?.detail || data?.error || `下载失败 (${response.status})`);
+  }
+  const disposition = response.headers.get("Content-Disposition") || "";
+  const match = disposition.match(/filename="?([^";]+)"?/i);
+  return {
+    blob: await response.blob(),
+    filename: match?.[1] || `${kind}-auth.zip`,
+    exported: Number(response.headers.get("X-Exported-Count") || 0),
+    skipped: Number(response.headers.get("X-Skipped-Count") || 0),
+  };
+}
+
 export const api = {
   health: () => request<{ ok: boolean }>("/api/health"),
   authMe: () => request<{ ok: boolean } & AuthState>("/api/auth/me"),
@@ -155,7 +209,15 @@ export const api = {
     if (params.limit) sp.set("limit", String(params.limit));
     if (params.offset) sp.set("offset", String(params.offset));
     const qs = sp.toString();
-    return request<{ ok: boolean; items: AccountRecord[]; count: number; offset: number; limit: number }>(
+    return request<{
+      ok: boolean;
+      items: AccountRecord[];
+      total: number | null;
+      count: number;
+      has_more?: boolean;
+      offset: number;
+      limit: number;
+    }>(
       `/api/accounts${qs ? `?${qs}` : ""}`
     );
   },
@@ -166,12 +228,24 @@ export const api = {
     ),
   accountAuthDownloadUrl: (id: number, kind: "cpa" | "grok2api") =>
     `/api/accounts/${id}/auth-json/${kind}/download`,
+  downloadAuthArchive,
   startRelogin: (id: number) =>
     request<{ ok: boolean; relogin: ReloginStatus }>(`/api/accounts/${id}/relogin`, {
       method: "POST",
     }),
+  startBatchRelogin: (ids: number[]) =>
+    request<{ ok: boolean; relogin: ReloginStatus }>("/api/accounts/relogin", {
+      method: "POST",
+      body: JSON.stringify({ ids }),
+    }),
   reloginStatus: () =>
     request<{ ok: boolean; relogin: ReloginStatus }>("/api/accounts/relogin/status"),
+  importAccountToGrok2API: (id: number) =>
+    request<{
+      ok: boolean;
+      result: { created?: number; updated?: number; synced?: number; syncFailed?: number };
+      item: AccountRecord;
+    }>(`/api/accounts/${id}/grok2api/import`, { method: "POST" }),
   deleteAccounts: (ids: number[], deleteFiles = true) =>
     request<{ ok: boolean; deleted: number; deleted_files: number; side_lines: number; file_errors: string[] }>(
       "/api/accounts/delete",

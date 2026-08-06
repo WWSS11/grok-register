@@ -24,6 +24,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .account_exports import build_account_auth_archive
 from .jobs import job_coordinator
 from .relogin_jobs import relogin_coordinator
 from backend.shared.paths import DATA_ROOT, PROJECT_ROOT, STATIC_ROOT
@@ -35,6 +36,7 @@ WEB_SESSION_COOKIE = "grok_register_session"
 WEB_SESSION_TTL = 60 * 60 * 24 * 7
 WEB_AUTH_FILE = DATA_DIR / "web_auth.json"
 LEGACY_WEB_AUTH_FILE = APP_DIR / "web_auth.json"
+MAX_BATCH_ACCOUNT_IDS = 1000
 
 CONFIG_PUBLIC_KEYS = (
     "email_provider",
@@ -67,6 +69,7 @@ CONFIG_PUBLIC_KEYS = (
     "enable_nsfw",
     "debug_mode",
     "browser_headless",
+    "browser_locale",
     "close_browser_on_stop",
     "log_level",
     "register_count",
@@ -78,6 +81,10 @@ CONFIG_PUBLIC_KEYS = (
     "cpa_remote_url",
     "cpa_management_key",
     "grok2api_auth_dir",
+    "grok2api_remote_url",
+    "grok2api_remote_username",
+    "grok2api_remote_password",
+    "grok2api_auto_import",
     "mailnest_api_key",
     "mailnest_project_code",
     "yyds_api_key",
@@ -95,14 +102,18 @@ SENSITIVE_HINT_KEYS = {
     "outlookemail_web_password",
     "outlookemail_session_cookie",
     "cpa_management_key",
+    "grok2api_remote_password",
     "mailnest_api_key",
     "yyds_api_key",
     "yyds_jwt",
 }
 
 
-class DeleteAccountsBody(BaseModel):
+class AccountIdsBody(BaseModel):
     ids: List[int] = Field(default_factory=list)
+
+
+class DeleteAccountsBody(AccountIdsBody):
     delete_files: bool = True
 
 
@@ -123,6 +134,26 @@ class LoginBody(BaseModel):
     username: str = ""
     password: str = ""
     confirm_password: str = ""
+
+
+def _batch_account_ids(ids: List[int]) -> List[int]:
+    normalized: List[int] = []
+    seen = set()
+    for account_id in ids or []:
+        if account_id <= 0:
+            raise HTTPException(status_code=400, detail="账号 ID 必须是正整数")
+        if account_id in seen:
+            continue
+        seen.add(account_id)
+        normalized.append(account_id)
+        if len(normalized) > MAX_BATCH_ACCOUNT_IDS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"单次最多操作 {MAX_BATCH_ACCOUNT_IDS} 个账号",
+            )
+    if not normalized:
+        raise HTTPException(status_code=400, detail="请选择要操作的账号")
+    return normalized
 
 
 def _gr():
@@ -279,6 +310,7 @@ def _apply_config_updates(updates: Dict[str, Any]) -> Dict[str, Any]:
             "browser_headless",
             "close_browser_on_stop",
             "cpa_auto_add",
+            "grok2api_auto_import",
             "outlookemail_disable_after_cpa_success",
         ):
             value = bool(value)
@@ -295,6 +327,10 @@ def _apply_config_updates(updates: Dict[str, Any]) -> Dict[str, Any]:
                 value = max(1, min(value, 50))
         elif key == "log_level":
             value = str(value or "info").strip().lower() or "info"
+        elif key == "browser_locale":
+            value = str(value or "en-US").strip()
+            if value not in {"en-US", "zh-CN"}:
+                value = "en-US"
         elif key == "email_provider":
             value = str(value or "cloudflare").strip().lower() or "cloudflare"
             if value not in {"cloudflare", "duckmail", "yyds", "mailnest", "outlookemail", "cloudmail"}:
@@ -319,6 +355,7 @@ def _apply_config_updates(updates: Dict[str, Any]) -> Dict[str, Any]:
         elif key in (
             "proxy",
             "cpa_remote_url",
+            "grok2api_remote_url",
             "outlookemail_api_base",
             "duckmail_api_base",
             "cloudflare_api_base",
@@ -346,6 +383,9 @@ def _serialize_record(record: Dict[str, Any]) -> Dict[str, Any]:
     item["cpa_enabled"] = bool(item.get("cpa_enabled"))
     item["sso_saved"] = bool(item.get("sso_saved"))
     raw_config = _gr().config
+    from backend.integrations.grok2api_client import Grok2APIClient
+
+    item["grok2api_remote_configured"] = Grok2APIClient.is_configured(raw_config)
     for kind in ("cpa", "grok2api"):
         try:
             _find_account_auth_file(item, raw_config, kind)
@@ -365,6 +405,10 @@ def _serialize_record(record: Dict[str, Any]) -> Dict[str, Any]:
             item["extra"] = {"raw": extra}
     else:
         item["extra"] = extra
+    extra_data = item["extra"] if isinstance(item["extra"], dict) else {}
+    item["exception_traceback"] = str(extra_data.get("exception_traceback") or "")
+    item["exception_type"] = str(extra_data.get("exception_type") or "")
+    item["has_exception_traceback"] = bool(item["exception_traceback"])
     return item
 
 
@@ -661,7 +705,7 @@ def create_app() -> FastAPI:
         email_disable_status: str = Query(""),
         q: str = Query(""),
         keyword: str = Query(""),
-        limit: int = Query(500, ge=1, le=10000),
+        limit: int = Query(20, ge=1, le=10000),
         offset: int = Query(0, ge=0),
     ) -> Dict[str, Any]:
         gr = _gr()
@@ -672,21 +716,72 @@ def create_app() -> FastAPI:
             status=status_norm,
             email_disable_status=str(email_disable_status or "").strip().lower(),
             keyword=keyword_norm,
-            limit=min(offset + limit, 10000),
+            limit=limit,
+            offset=offset,
         )
-        page = rows[offset : offset + limit]
+        total = store.count_results(
+            status=status_norm,
+            email_disable_status=str(email_disable_status or "").strip().lower(),
+            keyword=keyword_norm,
+        )
         return {
             "ok": True,
-            "total": len(rows) if offset == 0 and len(rows) < limit else None,
-            "count": len(page),
+            "total": total,
+            "count": len(rows),
+            "has_more": offset + len(rows) < total,
             "offset": offset,
             "limit": limit,
-            "items": [_serialize_record(row) for row in page],
+            "items": [_serialize_record(row) for row in rows],
         }
 
     @app.get("/api/accounts/relogin/status")
     def api_account_relogin_status() -> Dict[str, Any]:
         return {"ok": True, "relogin": relogin_coordinator.status()}
+
+    @app.post("/api/accounts/relogin")
+    def api_accounts_relogin(body: AccountIdsBody) -> Dict[str, Any]:
+        if job_coordinator.status().get("running"):
+            raise HTTPException(status_code=409, detail="注册任务运行中，请等待任务结束后重新登录")
+        try:
+            status = relogin_coordinator.start_many(_batch_account_ids(body.ids))
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"ok": True, "relogin": status}
+
+    @app.post("/api/accounts/auth-json/{kind}/download")
+    def api_accounts_auth_json_download(kind: str, body: AccountIdsBody) -> StreamingResponse:
+        normalized_kind = str(kind or "").strip().lower()
+        if normalized_kind not in {"cpa", "grok2api"}:
+            raise HTTPException(status_code=400, detail="kind 必须是 cpa 或 grok2api")
+        ids = _batch_account_ids(body.ids)
+        gr = _gr()
+        gr.load_config()
+        records = gr.get_registration_repository().get_results_by_ids(ids)
+        if not records:
+            raise HTTPException(status_code=404, detail="没有匹配的记录")
+        archive, exported, skipped = build_account_auth_archive(
+            records, gr.config, normalized_kind, _find_account_auth_file
+        )
+        if not exported:
+            label = "CPA" if normalized_kind == "cpa" else "Grok2API"
+            raise HTTPException(status_code=404, detail=f"所选账号均没有可导出的 {label} JSON")
+        filename = f"{normalized_kind}-auth-{time.strftime('%Y%m%d-%H%M%S')}.zip"
+        return StreamingResponse(
+            iter([archive]),
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Length": str(len(archive)),
+                "Cache-Control": "no-cache",
+                "X-Content-Type-Options": "nosniff",
+                "X-Exported-Count": str(exported),
+                "X-Skipped-Count": str(skipped),
+            },
+        )
 
     @app.get("/api/accounts/{account_id}")
     def api_account_detail(account_id: int) -> Dict[str, Any]:
@@ -710,6 +805,57 @@ def create_app() -> FastAPI:
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"ok": True, "relogin": status}
+
+    @app.post("/api/accounts/{account_id}/grok2api/import")
+    def api_account_grok2api_import(account_id: int) -> Dict[str, Any]:
+        """把已生成的 grok_build JSON 导入配置的远程 Grok2API。"""
+        from backend.integrations.grok2api_client import (
+            Grok2APIClient,
+            Grok2APIImportError,
+        )
+
+        gr = _gr()
+        gr.load_config()
+        store = gr.get_registration_repository()
+        rows = store.get_results_by_ids([account_id])
+        if not rows:
+            raise HTTPException(status_code=404, detail="记录不存在")
+        if not Grok2APIClient.is_configured(gr.config):
+            raise HTTPException(
+                status_code=400,
+                detail="请先在系统设置完整配置 Grok2API API 地址、管理员账号和密码",
+            )
+        try:
+            path = _find_account_auth_file(rows[0], gr.config, "grok2api")
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        try:
+            with Grok2APIClient.from_config(gr.config) as client:
+                result = client.import_auth_file(path)
+        except Grok2APIImportError as exc:
+            store.update_remote_import_status(
+                account_id,
+                "grok2api",
+                status="failed",
+                error=str(exc),
+            )
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        import_status = "partial" if int(result.get("syncFailed", 0) or 0) > 0 else "success"
+        import_error = (
+            f"远程同步失败 {result.get('syncFailed', 0)} 个"
+            if import_status == "partial"
+            else ""
+        )
+        store.update_remote_import_status(
+            account_id,
+            "grok2api",
+            status=import_status,
+            error=import_error,
+        )
+        refreshed = store.get_results_by_ids([account_id])[0]
+        return {"ok": True, "result": result, "item": _serialize_record(refreshed)}
 
     @app.get("/api/accounts/{account_id}/failure-screenshot")
     def api_account_failure_screenshot(account_id: int) -> FileResponse:
@@ -774,9 +920,7 @@ def create_app() -> FastAPI:
     @app.post("/api/accounts/delete")
     def api_accounts_delete(body: DeleteAccountsBody) -> Dict[str, Any]:
         gr = _gr()
-        ids = body.ids or []
-        if not ids:
-            raise HTTPException(status_code=400, detail="请提供要删除的 ids 列表")
+        ids = _batch_account_ids(body.ids)
 
         from backend.registration.artifacts import (
             cleanup_side_files_for_emails,

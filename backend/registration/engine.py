@@ -18,12 +18,14 @@ import re
 import string
 import json
 import base64
+import traceback
 
 from playwright._impl._errors import TargetClosedError as PageDisconnectedError
 from curl_cffi import requests
 
 # 授权交换和导出逻辑集中在 integrations 包，编排层只负责调用。
 from backend.integrations import auth_exchange as _s2cpa
+from backend.integrations import grok2api_client as _grok2api
 from backend.mailbox import cloudflare_worker as cloudflare_provider
 from backend.mailbox import cloud_mail as cloudmail_provider
 from backend.mailbox import duck_mail as duckmail_provider
@@ -83,9 +85,28 @@ CONFIG_FILE = os.path.abspath(
 ACCOUNTS_DIR = os.path.join(DATA_DIR, "accounts")
 RESULTS_DB_FILE = os.path.join(ACCOUNTS_DIR, "registration_results.sqlite3")
 MEMORY_CLEANUP_INTERVAL = 5
+TRACEBACK_MAX_CHARS = 60_000
+TRACEBACK_LOG_MAX_CHARS = 16_000
 
 _repository = None
 _repository_lock = threading.Lock()
+
+
+def current_exception_traceback(max_chars=TRACEBACK_MAX_CHARS):
+    """返回当前异常的标准堆栈；没有活动异常时返回空字符串。"""
+    text = traceback.format_exc().strip()
+    if not text or text == "NoneType: None":
+        return ""
+
+    limit = max(1_000, int(max_chars or TRACEBACK_MAX_CHARS))
+    if len(text) > limit:
+        tail_size = min(4_000, limit // 4)
+        text = (
+            text[: limit - tail_size]
+            + "\n... 异常堆栈过长，已截断 ...\n"
+            + text[-tail_size:]
+        )
+    return text
 
 
 def ensure_accounts_dir():
@@ -164,6 +185,7 @@ DEFAULT_CONFIG = {
     "enable_nsfw": True,
     "debug_mode": False,
     "browser_headless": False,
+    "browser_locale": "en-US",
     "close_browser_on_stop": False,
     "log_level": "info",
     "register_count": 1,
@@ -180,6 +202,11 @@ DEFAULT_CONFIG = {
     "cpa_management_key": "",
     # Grok2API grok_build 导入目录
     "grok2api_auth_dir": "data/grok2api_auth",
+    # 远程 Grok2API 管理端：登录后通过 SSE 导入 grok_build JSON
+    "grok2api_remote_url": "",
+    "grok2api_remote_username": "",
+    "grok2api_remote_password": "",
+    "grok2api_auto_import": True,
     "mailnest_api_key": "",
     "mailnest_project_code": "x-ai001",
     # YYDS：留空自动选已验证域名；填写则固定该域名
@@ -223,6 +250,7 @@ class RegistrationRiskDenied(Exception):
 
 
 FAIL_DOMAIN = "domain_rejected"
+FAIL_ALREADY_REGISTERED = "already_registered"
 FAIL_RISK = "registration_risk"
 FAIL_CODE = "code_timeout"
 FAIL_BROWSER = "browser"
@@ -233,6 +261,7 @@ FAIL_OTHER = "other"
 
 FAIL_LABELS = {
     FAIL_DOMAIN: "域名拒绝",
+    FAIL_ALREADY_REGISTERED: "账号已注册",
     FAIL_RISK: "注册风控",
     FAIL_CODE: "验证码超时",
     FAIL_BROWSER: "浏览器断开",
@@ -246,6 +275,8 @@ FAIL_LABELS = {
 def classify_failure(exc) -> str:
     if isinstance(exc, EmailDomainRejected):
         return FAIL_DOMAIN
+    if isinstance(exc, _rf.AccountAlreadyRegistered):
+        return FAIL_ALREADY_REGISTERED
     if isinstance(exc, RegistrationRiskDenied):
         return FAIL_RISK
     msg = str(exc or "")
@@ -460,6 +491,16 @@ def persist_registration_result(
                 "auth_path": detail.get("auth_path", ""),
                 "cpa_auth_path": detail.get("cpa_auth_path", ""),
                 "grok2api_auth_path": detail.get("grok2api_auth_path", ""),
+                "cpa_remote_status": detail.get("cpa_remote_status", "not_configured"),
+                "cpa_remote_imported_at": detail.get("cpa_remote_imported_at", ""),
+                "cpa_remote_error": detail.get("cpa_remote_error", ""),
+                "grok2api_remote_status": detail.get(
+                    "grok2api_remote_status", "not_configured"
+                ),
+                "grok2api_remote_imported_at": detail.get(
+                    "grok2api_remote_imported_at", ""
+                ),
+                "grok2api_remote_error": detail.get("grok2api_remote_error", ""),
                 "email_account_id": disable_detail.get("account_id", ""),
                 "email_disable_status": disable_detail.get("status", "not_attempted"),
                 "email_disabled_at": disable_detail.get("disabled_at", ""),
@@ -881,6 +922,12 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, result_out=None) -> b
         auth_path="",
         cpa_auth_path="",
         grok2api_auth_path="",
+        cpa_remote_status="not_configured",
+        cpa_remote_imported_at="",
+        cpa_remote_error="",
+        grok2api_remote_status="not_configured",
+        grok2api_remote_imported_at="",
+        grok2api_remote_error="",
         error="",
     )
     if not cpa_enabled:
@@ -891,6 +938,12 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, result_out=None) -> b
     remote_url = str(config.get("cpa_remote_url", "") or "").strip()
     management_key = str(config.get("cpa_management_key", "") or "").strip()
     g2a_dir = str(config.get("grok2api_auth_dir", "") or "").strip()
+    g2a_remote_configured = _grok2api.Grok2APIClient.is_configured(config)
+    g2a_auto_import = bool(config.get("grok2api_auto_import", False))
+    _set_result(
+        cpa_remote_status="ready" if remote_url and management_key else "not_configured",
+        grok2api_remote_status="ready" if g2a_remote_configured else "not_configured",
+    )
 
     # 相对路径基于项目根目录解析，并自动创建目录
     if auth_dir and not os.path.isabs(auth_dir):
@@ -1003,9 +1056,15 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, result_out=None) -> b
                 _cpa_log(f"已上传 CPA 远程 {remote_url.rstrip('/')}/.../{name}")
                 wrote_ok = True
                 auth_entries.append(f"CPA 远程: {remote_url.rstrip('/')}/.../{name}")
+                _set_result(
+                    cpa_remote_status="success",
+                    cpa_remote_imported_at=RegistrationRepository.now_text(),
+                    cpa_remote_error="",
+                )
             except Exception as remote_exc:
                 _cpa_log(f"CPA 远程上传失败: {remote_exc}")
                 auth_errors.append(f"CPA 远程失败: {remote_exc}")
+                _set_result(cpa_remote_status="failed", cpa_remote_error=str(remote_exc))
         if g2a_dir:
             try:
                 gpath = _s2cpa.write_grok2api_auth(_s2cpa.Path(g2a_dir), token, email=email)
@@ -1014,6 +1073,43 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, result_out=None) -> b
                 grok2api_auth_path_value = str(gpath)
                 auth_path_value = auth_path_value or str(gpath)
                 auth_entries.append(f"Grok2API: {gpath}")
+                if g2a_remote_configured and g2a_auto_import:
+                    try:
+                        with _grok2api.Grok2APIClient.from_config(config) as client:
+                            remote_result = client.import_auth_file(gpath)
+                        imported_at = RegistrationRepository.now_text()
+                        remote_status = (
+                            "partial"
+                            if int(remote_result.get("syncFailed", 0) or 0) > 0
+                            else "success"
+                        )
+                        remote_error = (
+                            f"远程同步失败 {remote_result.get('syncFailed', 0)} 个"
+                            if remote_status == "partial"
+                            else ""
+                        )
+                        _cpa_log(
+                            "已导入远程 Grok2API "
+                            f"(created={remote_result.get('created', 0)}, "
+                            f"updated={remote_result.get('updated', 0)}, "
+                            f"synced={remote_result.get('synced', 0)})"
+                        )
+                        auth_entries.append(
+                            f"Grok2API 远程: {str(config.get('grok2api_remote_url') or '').rstrip('/')}"
+                        )
+                        _set_result(
+                            grok2api_remote_status=remote_status,
+                            grok2api_remote_imported_at=imported_at,
+                            grok2api_remote_error=remote_error,
+                            grok2api_remote_result=remote_result,
+                        )
+                    except Exception as remote_g2a_exc:
+                        _cpa_log(f"Grok2API 远程导入失败: {remote_g2a_exc}")
+                        auth_errors.append(f"Grok2API 远程失败: {remote_g2a_exc}")
+                        _set_result(
+                            grok2api_remote_status="failed",
+                            grok2api_remote_error=str(remote_g2a_exc),
+                        )
             except Exception as g2a_exc:
                 _cpa_log(f"Grok2API 写入失败: {g2a_exc}")
                 auth_errors.append(f"Grok2API 失败: {g2a_exc}")
@@ -1952,6 +2048,11 @@ def is_browser_headless():
     return bool(config.get("browser_headless", False))
 
 
+def get_browser_locale() -> str:
+    value = str(config.get("browser_locale", "en-US") or "en-US").strip()
+    return value if value in {"en-US", "zh-CN"} else "en-US"
+
+
 def should_close_browser_after_run(user_stopped: bool) -> bool:
     """正常结束时非调试模式关闭；手动停止时严格以勾选项为准。"""
     if user_stopped:
@@ -1995,6 +2096,7 @@ def _wire_runtime_modules():
         get_proxies=get_proxies,
         is_debug=is_debug_mode,
         is_headless=is_browser_headless,
+        get_locale=get_browser_locale,
         extension_path=EXTENSION_PATH,
     )
     _rf.configure(
@@ -2049,6 +2151,8 @@ def run_registration(count):
     _token_mode_map = {"device_protocol": "协议 Device Flow", "device_browser": "浏览器 Device Flow", "auth_code": "Authorization Code"}
     _token_mode_label = _token_mode_map.get(str(config.get("cpa_token_mode", "device_protocol")), "协议 Device Flow")
     registration_log(f"[*] SSO→auth: {'开' if config.get('cpa_auto_add') else '关（账号将不计成功）'}" + (f"（{_token_mode_label}）" if config.get('cpa_auto_add') else ""))
+    traceback_log_lock = threading.Lock()
+    logged_traceback_signatures = set()
     # 启动前清理上次崩溃 / 强杀残留的临时 profile 目录
     try:
         _cleanup_stale_profiles(log_callback=registration_log)
@@ -2072,6 +2176,24 @@ def run_registration(count):
         return kind
 
     def _persist_result(*, started_at, worker_id=0, **kwargs):
+        trace_text = ""
+        if str(kwargs.get("status") or "").strip().lower() == "failure":
+            trace_text = current_exception_traceback()
+            if trace_text:
+                extra = dict(kwargs.get("extra") or {})
+                extra["exception_traceback"] = trace_text
+                extra["exception_type"] = trace_text.rstrip().splitlines()[-1]
+                kwargs["extra"] = extra
+                signature = hash(trace_text)
+                with traceback_log_lock:
+                    should_log_traceback = signature not in logged_traceback_signatures
+                    if should_log_traceback:
+                        logged_traceback_signatures.add(signature)
+                if should_log_traceback:
+                    registration_log(
+                        "[异常堆栈]\n"
+                        + current_exception_traceback(TRACEBACK_LOG_MAX_CHARS)
+                    )
         if (
             str(kwargs.get("status") or "").strip().lower() == "failure"
             and str(kwargs.get("failure_type") or "") != FAIL_CPA

@@ -30,6 +30,25 @@ from backend.automation.session import (
 
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
 
+
+class AccountAlreadyRegistered(Exception):
+    """资料提交后站点明确提示邮箱或账号已经存在。"""
+
+
+_ALREADY_REGISTERED_PATTERNS = (
+    re.compile(r"existing account found", re.I),
+    re.compile(r"email.{0,80}already.{0,40}(?:registered|exists|in use|used|taken)", re.I),
+    re.compile(r"account.{0,80}already.{0,40}(?:registered|exists)", re.I),
+    re.compile(r"already.{0,40}registered.{0,80}email", re.I),
+    re.compile(r"user.{0,60}already.{0,40}exists", re.I),
+    re.compile(r"email.{0,40}(?:is|address is).{0,20}(?:unavailable|not available)", re.I),
+    re.compile(r"邮箱.{0,40}(?:已|已经).{0,40}(?:注册|存在|使用|占用)"),
+    re.compile(r"账号.{0,40}(?:已|已经).{0,40}(?:注册|存在)"),
+    re.compile(r"找到现有(?:账号|账户)"),
+    re.compile(r"(?:账号|账户).{0,20}(?:已|已经).{0,40}(?:注册|存在)"),
+    re.compile(r"已存在与此邮箱地址关联的(?:账号|账户)"),
+)
+
 # 资料页 Cloudflare Turnstile：等待自动通过 + 智能点击，不调用 reset()
 CF_FIRST_RETRY_AFTER = 3.0   # 检测到 CF 后 3 秒即开始尝试（原 8 秒太慢）
 CF_RETRY_INTERVAL = 15.0     # 两次完整 getTurnstileToken 之间的间隔（避免频繁进入阻塞流程）
@@ -165,9 +184,9 @@ def _native_type_element(element, value: str, per_char: bool = True) -> bool:
         try:
             current = str(element.property("value") or "")
         except Exception:
-            current = ""
-        # 某些 React 控件异步更新 property；调用成功且无法读取值时交给页面推进检查。
-        return not current or current.strip() == text.strip()
+            current = None
+        # property 无法读取时交给页面推进检查；明确读到空值表示输入没有生效。
+        return current is None or current.strip() == text.strip()
     except Exception:
         return False
 
@@ -206,13 +225,13 @@ def _native_input_candidates(kind: str):
                 score = 100 if max_len == 1 else 0
                 score += 80 if autocomplete == "one-time-code" else 0
             elif kind == "given":
-                score = 100 if testid == "givenname" or name == "givenname" else 0
+                score = 100 if testid in ("givenname", "firstname") or name in ("givenname", "firstname") else 0
                 score += 90 if autocomplete == "given-name" else 0
-                score += 40 if "given" in meta or "名" in meta else 0
+                score += 40 if any(x in meta for x in ("given", "first name", "firstname", "名")) else 0
             elif kind == "family":
-                score = 100 if testid == "familyname" or name == "familyname" else 0
+                score = 100 if testid in ("familyname", "lastname", "surname") or name in ("familyname", "lastname", "surname") else 0
                 score += 90 if autocomplete == "family-name" else 0
-                score += 40 if "family" in meta or "姓" in meta else 0
+                score += 40 if any(x in meta for x in ("family", "last name", "lastname", "surname", "姓")) else 0
             elif kind == "password":
                 score = 110 if typ == "password" else 0
                 score += 90 if name == "password" or "password" in autocomplete else 0
@@ -448,20 +467,86 @@ def open_signup_page(log_callback=None, cancel_callback=None):
 
 
 def has_profile_form(log_callback=None):
+    return bool(_profile_page_snapshot().get("profile_form"))
+
+
+def _profile_page_snapshot():
+    """读取验证码后的页面状态，用元素特征确认是否已进入资料页。"""
     refresh_active_page()
     try:
-        return bool(
-            page.run_js(
-                """
-const givenInput = document.querySelector('input[data-testid="givenName"], input[name="givenName"], input[autocomplete="given-name"]');
-const familyInput = document.querySelector('input[data-testid="familyName"], input[name="familyName"], input[autocomplete="family-name"]');
-const passwordInput = document.querySelector('input[data-testid="password"], input[name="password"], input[type="password"]');
-return !!(givenInput && familyInput && passwordInput);
+        result = page.run_js(
+            r"""
+function isVisible(node) {
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  const rect = node.getBoundingClientRect();
+  return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0'
+    && rect.width > 0 && rect.height > 0 && !node.disabled && !node.readOnly;
+}
+function inputMeta(node) {
+  const labels = [];
+  if (node.id) {
+    const label = document.querySelector(`label[for="${CSS.escape(node.id)}"]`);
+    if (label) labels.push(label.innerText || label.textContent || '');
+  }
+  const parentLabel = node.closest('label');
+  if (parentLabel) labels.push(parentLabel.innerText || parentLabel.textContent || '');
+  return [
+    node.name, node.id, node.getAttribute('data-testid'), node.autocomplete,
+    node.getAttribute('aria-label'), node.placeholder, ...labels,
+  ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+const inputs = Array.from(document.querySelectorAll('input')).filter((node) => {
+  const type = String(node.type || 'text').toLowerCase();
+  return isVisible(node) && !['hidden', 'submit', 'button', 'checkbox', 'radio', 'file'].includes(type);
+});
+const described = inputs.map((node) => ({
+  node,
+  type: String(node.type || 'text').toLowerCase(),
+  meta: inputMeta(node),
+}));
+const given = described.find(({ meta }) => /(^|\s|[-_])(given|first)(\s|[-_]?name|$)|given-name|名字|名/.test(meta));
+const family = described.find(({ meta }) => /(^|\s|[-_])(family|last|sur)(\s|[-_]?(name|surname)|$)|family-name|姓/.test(meta));
+const password = described.find(({ type, meta }) => type === 'password' || /password|new-password|密码/.test(meta));
+const code = described.find(({ node, meta }) => {
+  const mode = String(node.inputMode || '').toLowerCase();
+  return /code|otp|verif|one-time|验证码/.test(meta)
+    || node.autocomplete === 'one-time-code'
+    || (mode === 'numeric' && Number(node.maxLength || 0) <= 8);
+});
+const textInputs = described.filter(({ type }) => ['text', ''].includes(type));
+const bodyText = String(document.body && (document.body.innerText || document.body.textContent) || '')
+  .replace(/\s+/g, ' ').trim().toLowerCase();
+const headingMatch = /complete your sign ?up|complete sign ?up|完成.*注册|创建.*账户/.test(bodyText.slice(0, 1200));
+const profileForm = !!password && (
+  (!!given && !!family)
+  || (headingMatch && textInputs.filter(({ node }) => node !== password?.node).length >= 2)
+);
+return {
+  profile_form: profileForm,
+  profile_heading: headingMatch,
+  code_form: !!code,
+  url: location.href,
+  inputs: described.slice(0, 8).map(({ type, meta }) => `${type}/${meta}`),
+};
             """
-            )
         )
+        return result if isinstance(result, dict) else {}
     except Exception:
-        return False
+        return {}
+
+
+def _wait_profile_page_after_code(wait=8.0, cancel_callback=None):
+    """验证码提交后轮询页面元素，确认资料页已经真实出现。"""
+    deadline = time.time() + max(float(wait or 0), 0.4)
+    last_snapshot = {}
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        last_snapshot = _profile_page_snapshot()
+        if last_snapshot.get("profile_form"):
+            return last_snapshot
+        sleep_with_cancel(0.4, cancel_callback)
+    return last_snapshot
 
 
 def detect_email_domain_rejection(email=""):
@@ -1069,9 +1154,17 @@ return false;
         raise Exception("获取验证码失败")
     clean_code = str(code).replace("-", "").strip()
     deadline = time.time() + timeout
+    last_transition_log_at = 0.0
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
+        page_snapshot = _profile_page_snapshot()
+        if page_snapshot.get("profile_form"):
+            if log_callback:
+                log_callback(
+                    f"[*] 已通过页面元素识别资料填写页: {page_snapshot.get('url', '')}"
+                )
+            return code
         native_filled = _native_fill_code(clean_code)
         if native_filled != "not-ready" and native_filled != "boxes-failed":
             filled = native_filled
@@ -1146,8 +1239,9 @@ return 'not-ready';
             sleep_with_cancel(0.5, cancel_callback)
             continue
 
-        clicked = _native_click_action(("确认邮箱", "继续", "下一步", "confirm", "continue", "next", "confirmar", "confirmer", "bestätigen", "確認"))
-        if not clicked:
+        native_clicked = _native_click_action(("确认邮箱", "继续", "下一步", "confirm", "continue", "next", "confirmar", "confirmer", "bestätigen", "確認"))
+        clicked = ""
+        if not native_clicked:
             clicked = page.run_js(
                 r"""
 function isVisible(node) {
@@ -1181,11 +1275,28 @@ return 'clicked';
                 """
             )
 
-        if clicked == "clicked" or clicked == "no-button":
-            if log_callback:
-                log_callback(f"[*] 已填写验证码并提交: {code}")
-            sleep_with_cancel(1.5, cancel_callback)
-            return code
+        click_triggered = bool(native_clicked) or clicked == "clicked"
+        if click_triggered or clicked == "no-button":
+            transition = _wait_profile_page_after_code(
+                wait=8.0,
+                cancel_callback=cancel_callback,
+            )
+            if transition.get("profile_form"):
+                if log_callback:
+                    click_detail = f" ({native_clicked})" if native_clicked else ""
+                    log_callback(
+                        f"[*] 已填写验证码并提交，页面元素确认进入资料页: {code}{click_detail}"
+                    )
+                return code
+            now = time.time()
+            if log_callback and now - last_transition_log_at >= 5:
+                last_transition_log_at = now
+                inputs = " | ".join(str(x) for x in transition.get("inputs", []))
+                log_callback(
+                    "[Debug] 验证码提交后尚未识别到资料页，继续检测: "
+                    f"url={transition.get('url', '')}; code_form={transition.get('code_form', False)}; "
+                    f"inputs={inputs or 'none'}"
+                )
 
         sleep_with_cancel(0.5, cancel_callback)
 
@@ -1466,6 +1577,7 @@ def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None
     last_cf_retry_at = 0.0
     last_cf_log_at = 0.0
     last_logged_token_len = None
+    last_form_diag_at = 0.0
 
     def _maybe_log_cf_wait(message, token_len):
         nonlocal last_cf_log_at, last_logged_token_len
@@ -1523,8 +1635,8 @@ function setInputValue(input, value) {
     return String(input.value || '').trim() === String(value || '').trim();
 }
 
-const givenInput = pickInput('input[data-testid="givenName"], input[name="givenName"], input[autocomplete="given-name"], input[aria-label*="名"]');
-const familyInput = pickInput('input[data-testid="familyName"], input[name="familyName"], input[autocomplete="family-name"], input[aria-label*="姓"]');
+const givenInput = pickInput('input[data-testid="givenName"], input[data-testid="firstName"], input[name="givenName"], input[name="firstName"], input[id*="firstName" i], input[autocomplete="given-name"], input[aria-label*="first name" i], input[placeholder*="first name" i], input[aria-label*="名"]');
+const familyInput = pickInput('input[data-testid="familyName"], input[data-testid="lastName"], input[name="familyName"], input[name="lastName"], input[name="surname"], input[id*="lastName" i], input[autocomplete="family-name"], input[aria-label*="last name" i], input[placeholder*="last name" i], input[aria-label*="姓"]');
 const passwordInput = pickInput('input[data-testid="password"], input[name="password"], input[type="password"], input[autocomplete="new-password"]');
 
 if (!givenInput || !familyInput || !passwordInput) return 'not-ready';
@@ -1604,6 +1716,27 @@ return 'filled-no-submit';
                 sleep_with_cancel(0.5, cancel_callback)
                 continue
             elif filled == "not-ready":
+                now = time.time()
+                if log_callback and now - last_form_diag_at >= 5:
+                    last_form_diag_at = now
+                    snapshot = page.run_js(
+                        r"""
+const inputs = Array.from(document.querySelectorAll('input')).filter((node) => {
+  const style = window.getComputedStyle(node);
+  const rect = node.getBoundingClientRect();
+  return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+}).slice(0, 8).map((node) => [
+  node.type || 'text', node.name || '', node.id || '', node.getAttribute('data-testid') || '',
+  node.autocomplete || '', node.getAttribute('aria-label') || '', node.placeholder || ''
+].join('/'));
+return { url: location.href, inputs };
+                        """
+                    )
+                    if isinstance(snapshot, dict):
+                        input_text = " | ".join(str(x) for x in snapshot.get("inputs", []))
+                        log_callback(
+                            f"[Debug] 等待资料表单字段: url={snapshot.get('url', '')}; inputs={input_text or 'none'}"
+                        )
                 sleep_with_cancel(0.5, cancel_callback)
                 continue
 
@@ -1721,6 +1854,110 @@ btn.focus(); btn.click(); return 'submitted';
         sleep_with_cancel(0.5, cancel_callback)
 
     raise Exception("最终注册页资料填写失败")
+
+
+def detect_account_already_registered():
+    """识别资料提交后的账号重复结果页。
+
+    浏览器语言固定为中英文，因此优先匹配已经真实确认的中英文提示；页面
+    结构（标题说明块、唯一邮件登录按钮、零输入框）仅用于文案变化时兜底。
+    """
+    try:
+        payload = page.run_js(
+            r"""
+function isVisible(node) {
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  const rect = node.getBoundingClientRect();
+  return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0'
+    && rect.width > 0 && rect.height > 0;
+}
+const selectors = [
+  '[role="alert"]', '[aria-live="assertive"]', '[aria-live="polite"]',
+  '[data-testid*="error" i]', '[data-testid*="alert" i]',
+  '[class*="error" i]', '[class*="alert" i]', '[class*="danger" i]'
+];
+const notices = [];
+for (const selector of selectors) {
+  for (const node of document.querySelectorAll(selector)) {
+    if (!isVisible(node)) continue;
+    const text = String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+    if (text && text.length <= 800) notices.push(text);
+  }
+}
+// 已注册结果页没有 data-testid；稳定结构是：标题说明块 + 唯一邮件登录按钮，
+// 且卡片内没有任何可见输入框。邮件图标 class 不随页面语言变化。
+let signature = { matched: false, name: '', text: '' };
+if (/\/sign-up(?:[/?#]|$)/i.test(location.pathname + location.search)) {
+  const headings = Array.from(document.querySelectorAll('h1')).filter(isVisible);
+  for (const heading of headings) {
+    const headingBlock = heading.parentElement;
+    const card = headingBlock && headingBlock.parentElement;
+    if (!headingBlock || !card) continue;
+    const description = Array.from(headingBlock.children).find((node) => node.tagName === 'P' && isVisible(node));
+    const mailButtons = Array.from(card.querySelectorAll('button[type="button"]')).filter((button) => {
+      return isVisible(button) && Boolean(button.querySelector('svg.lucide-mail'));
+    });
+    const visibleButtons = Array.from(card.querySelectorAll('button')).filter(isVisible);
+    const visibleInputs = Array.from(card.querySelectorAll('input, textarea, select')).filter(isVisible);
+    if (description && mailButtons.length === 1 && visibleButtons.length === 1 && visibleInputs.length === 0) {
+      const text = String(card.innerText || card.textContent || '').replace(/\s+/g, ' ').trim();
+      signature = {
+        matched: true,
+        name: 'existing-account-email-login-card',
+        text: text.slice(0, 800)
+      };
+      if (text) notices.unshift(text);
+      break;
+    }
+  }
+}
+const duplicateHeading = Array.from(document.querySelectorAll('h1, h2, h3, [role="heading"]')).find((node) => {
+  if (!isVisible(node)) return false;
+  const text = String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  return text.includes('existing account found') || text.includes('账号已存在') || text.includes('账号已注册')
+    || text.includes('找到现有账号') || text.includes('找到现有账户')
+    || text.includes('账户已存在') || text.includes('账户已注册');
+});
+if (duplicateHeading) {
+  let container = duplicateHeading.parentElement;
+  let resultText = String(duplicateHeading.innerText || duplicateHeading.textContent || '').trim();
+  for (let depth = 0; container && depth < 4; depth += 1, container = container.parentElement) {
+    const text = String(container.innerText || container.textContent || '').replace(/\s+/g, ' ').trim();
+    if (text.length >= resultText.length && text.length <= 800) resultText = text;
+    if (/login with email|使用邮箱登录/i.test(text) && text.length <= 800) break;
+  }
+  if (resultText) notices.unshift(resultText);
+}
+const body = String(document.body && (document.body.innerText || document.body.textContent) || '')
+  .replace(/\s+/g, ' ').trim().slice(0, 2400);
+return { notices: Array.from(new Set(notices)).slice(0, 20), body, url: location.href, signature };
+            """
+        )
+    except Exception:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    notices = payload.get("notices") if isinstance(payload.get("notices"), list) else []
+    candidates = [str(item or "").strip() for item in notices if str(item or "").strip()]
+    body = str(payload.get("body") or "").strip()
+    if body:
+        candidates.append(body)
+    for text in candidates:
+        for pattern in _ALREADY_REGISTERED_PATTERNS:
+            match = pattern.search(text)
+            if match:
+                if len(text) <= 500:
+                    return text[:500]
+                start = max(match.start() - 120, 0)
+                end = min(match.end() + 180, len(text))
+                return text[start:end]
+    signature = payload.get("signature") if isinstance(payload.get("signature"), dict) else {}
+    if signature.get("matched"):
+        signature_text = str(signature.get("text") or "").strip()
+        signature_name = str(signature.get("name") or "existing-account-card").strip()
+        return (signature_text or f"DOM:{signature_name}")[:500]
+    return ""
 
 
 def wait_for_sso_cookie(timeout=55, log_callback=None, cancel_callback=None):
@@ -1888,6 +2125,12 @@ return true;
             cur_url = _current_url()
             on_accounts = ("accounts.x.ai" in cur_url) or ("auth.x.ai" in cur_url)
             on_grok = "grok.com" in cur_url
+
+            registered_notice = detect_account_already_registered()
+            if registered_notice:
+                if log_callback:
+                    log_callback(f"[-] 注册失败，账号已注册: {registered_notice}")
+                raise AccountAlreadyRegistered(f"账号已注册: {registered_notice}")
 
             # 心跳：避免长时间无日志像卡死
             if log_callback and now - last_heartbeat >= 5:
@@ -2065,7 +2308,7 @@ return 'final-page-clicked-submit';
             refresh_active_page()
         except Exception as exc:
             name = type(exc).__name__
-            if name in ("AccountRetryNeeded", "RegistrationCancelled"):
+            if name in ("AccountRetryNeeded", "RegistrationCancelled", "AccountAlreadyRegistered"):
                 raise
             if log_callback:
                 log_callback(f"[Debug] 等待 sso 时异常: {exc}")
